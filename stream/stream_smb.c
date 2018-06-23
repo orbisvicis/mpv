@@ -21,7 +21,9 @@
 
 #include <libsmbclient.h>
 #include <unistd.h>
+#include <errno.h>
 
+#include "common/common.h"
 #include "common/msg.h"
 #include "stream.h"
 #include "options/m_option.h"
@@ -32,8 +34,14 @@
 #endif
 
 struct priv {
-    int fd;
+    SMBCFILE* file;
+    SMBCCTX* ctx;
 };
+
+static void priv_destructor(void* ptr) {
+    struct priv* priv = ptr;
+    smbc_free_context(priv->ctx, 1);
+}
 
 static void smb_auth_fn(const char *server, const char *share,
              char *workgroup, int wgmaxlen, char *username, int unmaxlen,
@@ -44,10 +52,11 @@ static void smb_auth_fn(const char *server, const char *share,
 
 static int control(stream_t *s, int cmd, void *arg) {
   struct priv *p = s->priv;
+  smbc_lseek_fn smbc_lseek_f = smbc_getFunctionLseek(p->ctx);
   switch(cmd) {
     case STREAM_CTRL_GET_SIZE: {
-      off_t size = smbc_lseek(p->fd,0,SEEK_END);
-      smbc_lseek(p->fd,s->pos,SEEK_SET);
+      off_t size = smbc_lseek_f(p->ctx, p->file,0,SEEK_END);
+      smbc_lseek_f(p->ctx, p->file,s->pos,SEEK_SET);
       if(size != (off_t)-1) {
         *(int64_t *)arg = size;
         return 1;
@@ -60,7 +69,8 @@ static int control(stream_t *s, int cmd, void *arg) {
 
 static int seek(stream_t *s,int64_t newpos) {
   struct priv *p = s->priv;
-  if(smbc_lseek(p->fd,newpos,SEEK_SET)<0) {
+  smbc_lseek_fn smbc_lseek_f = smbc_getFunctionLseek(p->ctx);
+  if(smbc_lseek_f(p->ctx, p->file,newpos,SEEK_SET)<0) {
     return 0;
   }
   return 1;
@@ -68,16 +78,18 @@ static int seek(stream_t *s,int64_t newpos) {
 
 static int fill_buffer(stream_t *s, char* buffer, int max_len){
   struct priv *p = s->priv;
-  int r = smbc_read(p->fd,buffer,max_len);
+  smbc_read_fn smbc_read_f = smbc_getFunctionRead(p->ctx);
+  int r = smbc_read_f(p->ctx, p->file,buffer,max_len);
   return (r <= 0) ? -1 : r;
 }
 
 static int write_buffer(stream_t *s, char* buffer, int len) {
   struct priv *p = s->priv;
+  smbc_write_fn smbc_write_f = smbc_getFunctionWrite(p->ctx);
   int r;
   int wr = 0;
   while (wr < len) {
-    r = smbc_write(p->fd,buffer,len);
+    r = smbc_write_f(p->ctx, p->file,buffer,len);
     if (r <= 0)
       return -1;
     wr += r;
@@ -88,14 +100,16 @@ static int write_buffer(stream_t *s, char* buffer, int len) {
 
 static void close_f(stream_t *s){
   struct priv *p = s->priv;
-  smbc_close(p->fd);
+  smbc_close_fn smbc_close_f = smbc_getFunctionClose(p->ctx);
+  smbc_close_f(p->ctx, p->file);
 }
 
 static int open_f (stream_t *stream)
 {
   char *filename;
   int64_t len;
-  int fd, err;
+  SMBCFILE* file;
+  SMBCCTX* ctx;
 
   struct priv *priv = talloc_zero(stream, struct priv);
   stream->priv = priv;
@@ -110,28 +124,42 @@ static int open_f (stream_t *stream)
     return STREAM_ERROR;
   }
 
-  err = smbc_init(smb_auth_fn, 1);
-  if (err < 0) {
-    MP_ERR(stream, "Cannot init the libsmbclient library: %d\n",err);
-    return STREAM_ERROR;
+  //smbc_thread_posix();
+
+  ctx = smbc_new_context();
+  if (!ctx) {
+      MP_ERR(stream, "Cannot create a new libsmbclient context: %s\n", mp_strerror(errno));
+      return STREAM_ERROR;
   }
 
-  fd = smbc_open(filename, m,0644);
-  if (fd < 0) {
+  priv->ctx = ctx;
+
+  talloc_set_destructor(priv, priv_destructor);
+
+  ctx = smbc_init_context(ctx);
+  if (!ctx) {
+      MP_ERR(stream, "Cannot initialize a new libsmbclient context: %s\n", mp_strerror(errno));
+      return STREAM_ERROR;
+  }
+
+  smbc_setFunctionAuthData(ctx, smb_auth_fn);
+
+  file = smbc_getFunctionOpen(ctx)(ctx, filename, m, 0644);
+  if (!file) {
     MP_ERR(stream, "Could not open from LAN: '%s'\n", filename);
     return STREAM_ERROR;
   }
 
   len = 0;
   if(!write) {
-    len = smbc_lseek(fd,0,SEEK_END);
-    smbc_lseek (fd, 0, SEEK_SET);
+    len = smbc_getFunctionLseek(ctx)(ctx, file, 0, SEEK_END);
+    smbc_getFunctionLseek(ctx)(ctx, file, 0, SEEK_SET);
   }
   if(len > 0 || write) {
     stream->seekable = true;
     stream->seek = seek;
   }
-  priv->fd = fd;
+  priv->file = file;
   stream->fill_buffer = fill_buffer;
   stream->write_buffer = write_buffer;
   stream->close = close_f;
